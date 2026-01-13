@@ -1,3 +1,4 @@
+install_socks5.sh
 交互式
 curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5.sh -o install.sh \
 && chmod +x install.sh \
