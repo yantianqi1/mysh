@@ -1,0 +1,4 @@
+
+curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5.sh -o install.sh \
+&& chmod +x install.sh \
+&& sudo ./install.sh
