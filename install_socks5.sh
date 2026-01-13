@@ -60,14 +60,12 @@ detect_public_ip() {
 }
 
 kill_existing_danted() {
-  # 尽量彻底，避免端口被旧进程占用
   pkill -9 -x danted 2>/dev/null || true
   pkill -9 -f "/usr/sbin/danted .* -f /etc/danted.conf" 2>/dev/null || true
   sleep 1
 }
 
 ensure_cron_reboot() {
-  # 去重后再加，避免重复条目
   local line="@reboot nohup /usr/sbin/danted -D -f /etc/danted.conf >/var/log/danted.nohup.log 2>&1 &"
   ( crontab -l 2>/dev/null | grep -vF "/usr/sbin/danted -D -f /etc/danted.conf" || true
     echo "$line"
@@ -75,10 +73,8 @@ ensure_cron_reboot() {
 }
 
 start_danted_auto() {
-  local start_mode=""
-  local ok=0
+  local start_mode="" ok=0
 
-  # 先试 systemd（如果能用就用）
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop danted 2>/dev/null || true
     if systemctl restart danted 2>/dev/null; then
@@ -90,7 +86,6 @@ start_danted_auto() {
     fi
   fi
 
-  # systemd 不行就 fallback 到 nohup（适配 NAMESPACE/LXC）
   if [[ "$ok" -ne 1 ]]; then
     kill_existing_danted
     nohup /usr/sbin/danted -D -f /etc/danted.conf >/var/log/danted.nohup.log 2>&1 &
@@ -106,20 +101,95 @@ verify_listen() {
   ss -lntp | grep -q ":${port}" || return 1
 }
 
+# 规范化白名单：支持 "1.2.3.4,5.6.7.0/24"；无 / 默认补 /32；去空格
+normalize_whitelist() {
+  local raw="$1"
+  raw="${raw// /}"
+  raw="${raw//	/}"
+  [[ -z "$raw" ]] && { echo ""; return 0; }
+
+  local out="" item=""
+  IFS=',' read -ra arr <<< "$raw"
+  for item in "${arr[@]}"; do
+    [[ -z "$item" ]] && continue
+    if [[ "$item" == */* ]]; then
+      out+="${item},"
+    else
+      out+="${item}/32,"
+    fi
+  done
+  out="${out%,}"
+  echo "$out"
+}
+
+# 根据白名单生成 danted 规则块（client/socks）
+gen_rules_blocks() {
+  local wl="$1"
+  if [[ -z "$wl" ]]; then
+cat <<'EOF'
+client pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+  protocol: tcp
+  command: connect
+}
+EOF
+  else
+    local item=""
+    IFS=',' read -ra arr <<< "$wl"
+    for item in "${arr[@]}"; do
+cat <<EOF
+client pass {
+  from: ${item} to: 0.0.0.0/0
+}
+
+EOF
+    done
+
+    # 默认拒绝其它来源（白名单模式）
+cat <<'EOF'
+client block {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+
+EOF
+
+    for item in "${arr[@]}"; do
+cat <<EOF
+socks pass {
+  from: ${item} to: 0.0.0.0/0
+  protocol: tcp
+  command: connect
+}
+
+EOF
+    done
+
+cat <<'EOF'
+socks block {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+EOF
+  fi
+}
+
 # ========== Main ==========
 need_root
 
 DEFAULT_PORT="${DEFAULT_PORT:-1080}"
 DEFAULT_USER="${DEFAULT_USER:-proxyuser}"
 
-# env for non-interactive (optional)
 MACHINE_TYPE="${MACHINE_TYPE:-}"   # nat|vps
 AUTH_MODE="${AUTH_MODE:-}"         # noauth|auth
 PROXY_PORT="${PROXY_PORT:-}"
-EXTERNAL_PORT="${EXTERNAL_PORT:-}" # nat 外部端口（你要的一行地址用这个）
-PUBLIC_IP="${PUBLIC_IP:-}"         # 可选：手动指定公网IP/域名
+EXTERNAL_PORT="${EXTERNAL_PORT:-}"
+PUBLIC_IP="${PUBLIC_IP:-}"
 PROXY_USER="${PROXY_USER:-}"
 PROXY_PASS="${PROXY_PASS:-}"
+WHITELIST_IPS="${WHITELIST_IPS:-}" # noauth 白名单（多个逗号分隔），可为空
 
 IFACE="$(detect_iface)"
 
@@ -142,7 +212,7 @@ if [[ -z "$AUTH_MODE" ]]; then
   if has_tty; then
     echo "是否启用用户名密码？"
     echo "  1) 启用（更安全）"
-    echo "  2) 不启用（直接 socks5h://host:port）"
+    echo "  2) 不启用（无密码）"
     c="$(read_default "选择" "2")"
     [[ "$c" == "1" ]] && AUTH_MODE="auth" || AUTH_MODE="noauth"
   else
@@ -156,9 +226,7 @@ if [[ -z "$PROXY_PORT" ]]; then
   PROXY_PORT="$(read_default "SOCKS5 内部监听端口" "$DEFAULT_PORT")"
 fi
 
-# 4) NAT 外部端口（你要的“一行地址”关键）
-#    - NAT 必问（默认等于内部端口，但建议你输入面板外部端口如 11111）
-#    - VPS 可选（默认=内部端口）
+# 4) NAT 外部端口（最终一行地址用这个）
 if [[ "$MACHINE_TYPE" == "nat" ]]; then
   if [[ -z "$EXTERNAL_PORT" ]]; then
     EXTERNAL_PORT="$(read_required "请输入【外部转发端口】（面板外部端口，如 11111）")"
@@ -173,14 +241,25 @@ fi
 if [[ -z "$PUBLIC_IP" ]]; then
   if has_tty; then
     ip_guess="$(detect_public_ip)"
-    PUBLIC_IP="$(read_default "请输入公网IP/域名（直接回车=自动检测）" "${ip_guess:-<公网IP>}")"
+    PUBLIC_IP="$(read_default "请输入公网IP/域名（回车=自动检测）" "${ip_guess:-<公网IP>}")"
   else
     PUBLIC_IP="$(detect_public_ip)"
     PUBLIC_IP="${PUBLIC_IP:-<公网IP>}"
   fi
 fi
 
-# 6) 账号密码（如果需要）
+# 6) 无密码模式：询问白名单 IP（可空）
+if [[ "$AUTH_MODE" == "noauth" ]]; then
+  if [[ -z "$WHITELIST_IPS" && $(has_tty; echo $?) -eq 0 ]]; then
+    echo "无密码模式建议设置白名单（只允许这些IP连接）。"
+    echo "可输入多个，用逗号分隔。例如：1.2.3.4,5.6.7.0/24"
+    echo "留空表示不限制。"
+    read -r -p "白名单IP（可空）: " WHITELIST_IPS
+  fi
+  WHITELIST_IPS="$(normalize_whitelist "$WHITELIST_IPS")"
+fi
+
+# 7) 账号密码（如果需要）
 if [[ "$AUTH_MODE" == "auth" ]]; then
   [[ -n "$PROXY_USER" ]] || PROXY_USER="$(read_default "代理用户名" "$DEFAULT_USER")"
   [[ -n "$PROXY_PASS" ]] || PROXY_PASS="$(read_secret "代理密码")"
@@ -191,7 +270,9 @@ export DEBIAN_FRONTEND=noninteractive
 apt update -y >/dev/null
 apt install -y dante-server curl >/dev/null
 
-# 写配置（✅ 关键：clientmethod/socksmethod + socks pass）
+# 写配置（关键：clientmethod/socksmethod + socks pass）
+RULES="$(gen_rules_blocks "${WHITELIST_IPS:-}")"
+
 if [[ "$AUTH_MODE" == "auth" ]]; then
   id "$PROXY_USER" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin "$PROXY_USER"
   echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
@@ -208,15 +289,7 @@ socksmethod: username
 user.privileged: root
 user.notprivileged: nobody
 
-client pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-}
-
-socks pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  protocol: tcp
-  command: connect
-}
+${RULES}
 EOF
 else
   cat >/etc/danted.conf <<EOF
@@ -231,15 +304,7 @@ socksmethod: none
 user.privileged: root
 user.notprivileged: nobody
 
-client pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-}
-
-socks pass {
-  from: 0.0.0.0/0 to: 0.0.0.0/0
-  protocol: tcp
-  command: connect
-}
+${RULES}
 EOF
 fi
 
@@ -248,6 +313,7 @@ kill_existing_danted
 
 # 启动（systemd 不行就 nohup）
 START_MODE="$(start_danted_auto)"
+: "${START_MODE:?}"
 
 # 校验监听
 if ! verify_listen "$PROXY_PORT"; then
@@ -256,12 +322,9 @@ if ! verify_listen "$PROXY_PORT"; then
   exit 1
 fi
 
-# ====== 最终输出：只输出一行地址（方便复制）======
+# 最终输出：只输出一行地址
 if [[ "$AUTH_MODE" == "auth" ]]; then
   echo "socks5h://${PROXY_USER}:${PROXY_PASS}@${PUBLIC_IP}:${EXTERNAL_PORT}"
 else
   echo "socks5h://${PUBLIC_IP}:${EXTERNAL_PORT}"
 fi
-
-# 额外：你需要排查时再看这个文件（默认不打印）
-# /var/log/danted.nohup.log
