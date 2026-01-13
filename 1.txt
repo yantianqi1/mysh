@@ -1,8 +1,9 @@
 install_socks5.sh
 交互式
-curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5.sh -o install.sh \
-&& chmod +x install.sh \
-&& sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5.sh -o install.sh
+chmod +x install.sh
+sudo ./install.sh
+
 
 非交互式-手动设置白名单
 curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5.sh | \
