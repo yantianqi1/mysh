@@ -10,3 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/install_socks5
 sudo env MACHINE_TYPE=nat AUTH_MODE=noauth PROXY_PORT=1080 EXTERNAL_PORT=11111 PUBLIC_IP=185.7.242.119 \
 WHITELIST_IPS="1.2.3.4,8.8.8.8" bash
 
+
+
+nat-socks.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/nat-socks.sh)
