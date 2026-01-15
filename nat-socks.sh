@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# nat-socks.sh (FORCE-OVERWRITE + WAIT-LISTEN Edition)
-# Debian/Ubuntu 一键部署 SOCKS5（无认证）基于 gost
-# ✅ 强制覆盖安装：清理旧服务/旧进程/旧配置
-# ✅ 单监听 [::]:PORT：避免 v4/v6 抢端口（适配性最佳）
-# ✅ IPv6 出口抗抖检测
-# ✅ 输出 IPv4 + 多 IPv6 连接串
-# ✅ 修复：加入端口监听等待重试（避免 49ms 启动误判）
+# nat-socks.sh (FORCE-OVERWRITE + AUTO-TEST + NETCAT Edition)
+# Debian/Ubuntu 一键部署 SOCKS5（无认证），基于 gost
+#
+# ✅ 强制覆盖安装（清理旧服务/旧配置/旧进程）
+# ✅ 单监听 [::]:PORT（同时支持 IPv4+IPv6，避免冲突）
+# ✅ IPv6 出口检测抗抖（路由 + ping6 + curl6）
+# ✅ 输出公网 IPv4 + 多个公网 IPv6 连接串
+# ✅ 自动安装 netcat-openbsd（提供 nc 测试）
+# ✅ 自动本机测试（立即输出测试结果）
+# ✅ 输出“一键复制测试命令”（VPS本机 + 外网客户端）
 
 set -euo pipefail
 
+# ---------- 颜色 ----------
 RED=$'\033[31m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
@@ -18,6 +22,8 @@ RESET=$'\033[0m'
 
 info()  { echo "${BLUE}[信息]${RESET} $*"; }
 warn()  { echo "${YELLOW}[警告]${RESET} $*"; }
+ok()    { echo "${GREEN}[成功]${RESET} $*"; }
+fail()  { echo "${RED}[失败]${RESET} $*"; }
 die()   { echo "${RED}[错误]${RESET} $*" >&2; exit 1; }
 
 need_root() {
@@ -28,13 +34,15 @@ need_root() {
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- 依赖安装 ----------
 install_deps() {
-  info "正在安装依赖（curl, wget, tar）..."
+  info "正在安装依赖（curl, wget, tar, netcat-openbsd）..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null
-  apt-get install -y curl wget tar ca-certificates >/dev/null
+  apt-get install -y curl wget tar ca-certificates netcat-openbsd >/dev/null
 }
 
+# ---------- 交互输入端口 ----------
 ask_port() {
   local p=""
   echo
@@ -46,6 +54,7 @@ ask_port() {
   SOCKS_PORT="$p"
 }
 
+# ---------- 架构判断 ----------
 detect_arch() {
   local m
   m="$(uname -m)"
@@ -57,6 +66,7 @@ detect_arch() {
   info "检测到系统架构：${GOST_ARCH}"
 }
 
+# ---------- 获取 gost 最新版本 ----------
 get_latest_gost_tag() {
   local api="https://api.github.com/repos/go-gost/gost/releases/latest"
   local tag
@@ -67,6 +77,7 @@ get_latest_gost_tag() {
   echo "$tag"
 }
 
+# ---------- 下载并安装 gost ----------
 download_and_install_gost() {
   local tag ver url tarball
   local tmpdir=""
@@ -81,14 +92,9 @@ download_and_install_gost() {
   tmpdir="$(mktemp -d)"
   trap '[[ -n "${tmpdir-}" && -d "${tmpdir-}" ]] && rm -rf "${tmpdir-}"' EXIT
 
-  if cmd_exists curl; then
-    curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 120 \
-      -o "${tmpdir}/${tarball}" "$url" \
-      || die "下载失败（curl）。"
-  else
-    wget -T 30 -t 3 -O "${tmpdir}/${tarball}" "$url" \
-      || die "下载失败（wget）。"
-  fi
+  curl -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 120 \
+    -o "${tmpdir}/${tarball}" "$url" \
+    || die "下载失败（curl）。"
 
   info "正在解压..."
   tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir" || die "解压失败。"
@@ -102,6 +108,7 @@ download_and_install_gost() {
   info "已安装 gost 到：/usr/local/bin/gost"
 }
 
+# ---------- 强制清理 ----------
 force_cleanup_all() {
   info "开始强制清理历史残留（旧进程/旧服务/旧配置）..."
 
@@ -121,6 +128,7 @@ force_cleanup_all() {
   info "强制清理完成。"
 }
 
+# ---------- IPv6 出口检测 ----------
 check_ipv6_egress() {
   if ! ip -6 route show default 2>/dev/null | grep -q '^default'; then
     IPV6_OK=0
@@ -137,6 +145,7 @@ check_ipv6_egress() {
   fi
 }
 
+# ---------- 获取公网 IP ----------
 get_public_ipv4() {
   local ip=""
   ip="$(curl -4 -fsS --max-time 8 https://ipinfo.io/ip 2>/dev/null | tr -d ' \r\n' || true)"
@@ -154,6 +163,7 @@ get_public_ipv6_external() {
 }
 
 get_public_ipv6_local_all() {
+  # 仅输出 scope global 的公网 IPv6，过滤掉 ULA(fdxx) 和 link-local(fe80)
   ip -6 addr show scope global 2>/dev/null \
     | awk '/inet6/ {print $2}' \
     | cut -d/ -f1 \
@@ -172,6 +182,7 @@ merge_ipv6_list() {
   } | awk 'NF' | sort -u
 }
 
+# ---------- 写入 gost 配置 ----------
 write_gost_config() {
   mkdir -p /etc/nat-socks
 
@@ -205,6 +216,7 @@ EOF
   info "配置文件已写入：/etc/nat-socks/gost.yaml"
 }
 
+# ---------- systemd ----------
 write_systemd_service() {
   cat > /etc/systemd/system/nat-socks.service <<'EOF'
 [Unit]
@@ -233,7 +245,7 @@ start_service_fresh() {
   systemctl start nat-socks >/dev/null 2>&1 || true
 }
 
-# ✅ 修复点：等待端口真正监听（最多 3 秒）
+# ---------- 等待监听 ----------
 wait_listening() {
   local i
   for i in $(seq 1 30); do
@@ -246,11 +258,10 @@ wait_listening() {
 }
 
 assert_listening() {
-  # 先等一等（避免刚启动 49ms 的误判）
   if wait_listening; then
+    ok "已检测到端口 ${SOCKS_PORT} 正在监听。"
     return 0
   fi
-
   systemctl --no-pager -l status nat-socks || true
   warn "当前监听列表："
   ss -lntp 2>/dev/null || true
@@ -259,14 +270,47 @@ assert_listening() {
   die "部署失败：未检测到端口 ${SOCKS_PORT} 正在监听。"
 }
 
-health_check_proxy() {
-  if ! curl -fsS --max-time 8 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org >/dev/null 2>&1; then
-    systemctl --no-pager -l status nat-socks || true
-    journalctl -u nat-socks -n 60 --no-pager || true
-    die "本机 SOCKS5 测试失败：无法通过代理访问外网。"
+# ---------- 本机自动测试（输出结果） ----------
+run_local_tests() {
+  echo
+  echo "${BOLD}================ 本机自动测试 ================${RESET}"
+
+  # 1) 端口监听
+  if ss -lnt 2>/dev/null | grep -qE "[:.]${SOCKS_PORT}\b"; then
+    ok "监听检测：端口 ${SOCKS_PORT} 已监听"
+  else
+    fail "监听检测：端口 ${SOCKS_PORT} 未监听"
+    return 1
+  fi
+
+  # 2) SOCKS5 -> IPv4 出口
+  local out4=""
+  out4="$(curl -fsS --max-time 8 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "${out4:-}" ]]; then
+    ok "SOCKS5 IPv4 出口测试：通（出口 IPv4 = ${out4}）"
+  else
+    fail "SOCKS5 IPv4 出口测试：不通"
+    return 1
+  fi
+
+  # 3) SOCKS5 -> IPv6 出口
+  local out6=""
+  out6="$(curl -fsS --max-time 8 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
+  if [[ -n "${out6:-}" ]]; then
+    ok "SOCKS5 IPv6 出口测试：通（出口 IPv6 = ${out6}）"
+  else
+    warn "SOCKS5 IPv6 出口测试：不通（目标可能不支持 IPv6 或出口策略不同）"
+  fi
+
+  # 4) nc 测试本机端口
+  if nc -vz 127.0.0.1 "${SOCKS_PORT}" >/dev/null 2>&1; then
+    ok "nc 本机端口测试：通（127.0.0.1:${SOCKS_PORT}）"
+  else
+    warn "nc 本机端口测试：不通（可能 nc 行为差异，但不影响代理可用性）"
   fi
 }
 
+# ---------- 输出最终信息 + 一键复制测试命令 ----------
 final_output() {
   local pub4="$1"
   local ipv6_list="$2"
@@ -303,6 +347,32 @@ final_output() {
   fi
 
   echo
+  echo "${BOLD}================ 一键复制测试命令 ================${RESET}"
+
+  cat <<EOF
+# ✅ VPS 本机测试（复制整段执行）
+ss -lntp | grep ${SOCKS_PORT} || true
+curl -v -x socks5h://127.0.0.1:${SOCKS_PORT} https://api.ipify.org && echo
+curl -v -x socks5h://127.0.0.1:${SOCKS_PORT} https://ipv6.icanhazip.com && echo
+
+EOF
+
+  # 给外网测试命令（优先给第一条 IPv6）
+  local first_v6=""
+  first_v6="$(echo "${ipv6_list:-}" | head -n1 | tr -d ' \r\n' || true)"
+  if [[ -n "${first_v6:-}" ]]; then
+    cat <<EOF
+# ✅ 外网（Mac/Win/Linux）IPv6 直连测试（复制执行）
+nc -vz ${first_v6} ${SOCKS_PORT}
+curl -vv --socks5-hostname "[${first_v6}]:${SOCKS_PORT}" https://api.ipify.org
+curl -vv --socks5-hostname "[${first_v6}]:${SOCKS_PORT}" https://ipv6.icanhazip.com
+
+EOF
+  else
+    cat <<EOF
+# ⚠️ 未检测到公网 IPv6，本机可用但外网直连 IPv6 无法测试
+EOF
+  fi
 }
 
 main() {
@@ -319,9 +389,10 @@ main() {
   write_systemd_service
   start_service_fresh
 
-  # ✅ 必须监听成功 + 代理可用，否则退出
   assert_listening
-  health_check_proxy
+
+  # 本机自动测试（直接输出结果）
+  run_local_tests
 
   local pub4 ipv6_list
   pub4="$(get_public_ipv4)"
