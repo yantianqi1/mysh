@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# nat-socks.sh (Ultimate Compatibility Edition)
-# Debian/Ubuntu 一键部署 SOCKS5 代理（无认证），基于 gost（Go Simple Tunnel）
+# nat-socks.sh (Ultimate FORCE-OVERWRITE Edition)
+# Debian/Ubuntu 一键部署 SOCKS5 代理（无认证），基于 gost
 #
-# 适用场景：NAT 架构低配 VPS（小鸡）、LXC / veth 环境、IPv4/IPv6 双栈
-#
-# 设计目标（适配性最强）：
+# ✅ 强制覆盖安装：无论之前部署过什么版本，全部清理干净重新部署
 # ✅ 只输入一个参数：SOCKS5 内部监听端口
-# ✅ 自动安装依赖：curl/wget/tar/ca-certificates
-# ✅ 自动识别架构：amd64/arm64
-# ✅ 自动下载 gost 最新版本并安装到 /usr/local/bin/gost
+# ✅ 自动安装依赖 / 自动识别架构 / 下载 gost 最新版
 # ✅ systemd 服务 nat-socks（开机自启）
-# ✅ 只使用单监听：[::]:PORT（同时支持 IPv4 + IPv6，避免端口冲突）
-# ✅ IPv6 出口检测抗抖（避免误判）
-# ✅ IPv6 优先策略：若 IPv6 出口可用 -> prefer: ipv6，否则 prefer: ipv4
-# ✅ 最终输出公网 IPv4/IPv6 连接串（绿色高亮）
-# ✅ 输出 NAT 端口映射提醒（IPv4 必须外部端口 -> 内部端口）
+# ✅ 单监听 [::]:PORT（避免 v4/v6 端口冲突，适配性最强）
+# ✅ IPv6 出口检测抗抖（默认路由 + ping6 + curl6 重试）
+# ✅ 最终输出 IPv4 + 多 IPv6 连接串（过滤 ULA、link-local）
 
 set -euo pipefail
 
@@ -30,7 +24,6 @@ info()  { echo "${BLUE}[信息]${RESET} $*"; }
 warn()  { echo "${YELLOW}[警告]${RESET} $*"; }
 die()   { echo "${RED}[错误]${RESET} $*" >&2; exit 1; }
 
-# ---------- 基础检查 ----------
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     die "请用 root 执行：sudo bash $0"
@@ -39,7 +32,6 @@ need_root() {
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# ---------- 依赖安装 ----------
 install_deps() {
   info "正在安装依赖（curl, wget, tar）..."
   export DEBIAN_FRONTEND=noninteractive
@@ -47,22 +39,17 @@ install_deps() {
   apt-get install -y curl wget tar ca-certificates >/dev/null
 }
 
-# ---------- 交互输入端口 ----------
 ask_port() {
   local p=""
   echo
   echo "请输入 SOCKS5 监听端口（这是 VPS 内部端口，不是 NAT 外部映射端口）"
   read -r -p "SOCKS5 内部监听端口 (1-65535): " p
-
-  # 去掉空格/回车等杂质，最大兼容
   p="$(echo "$p" | tr -d ' \t\r\n')"
-
   [[ "$p" =~ ^[0-9]+$ ]] || die "端口必须是数字。"
   (( p >= 1 && p <= 65535 )) || die "端口范围必须是 1-65535。"
   SOCKS_PORT="$p"
 }
 
-# ---------- 架构判断 ----------
 detect_arch() {
   local m
   m="$(uname -m)"
@@ -74,7 +61,6 @@ detect_arch() {
   info "检测到系统架构：${GOST_ARCH}"
 }
 
-# ---------- 获取 gost 最新版本 ----------
 get_latest_gost_tag() {
   local api="https://api.github.com/repos/go-gost/gost/releases/latest"
   local tag
@@ -87,7 +73,6 @@ get_latest_gost_tag() {
   echo "$tag"
 }
 
-# ---------- 下载并安装 gost ----------
 download_and_install_gost() {
   local tag ver url tarball
   local tmpdir=""
@@ -125,12 +110,36 @@ download_and_install_gost() {
   info "已安装 gost 到：/usr/local/bin/gost"
 }
 
+# ---------- 强制清理：无论历史部署过什么，都清掉 ----------
+force_cleanup_all() {
+  info "开始强制清理历史残留（旧进程/旧服务/旧配置）..."
+
+  # 1) 停止并禁用服务（存在则清）
+  systemctl stop nat-socks >/dev/null 2>&1 || true
+  systemctl disable nat-socks >/dev/null 2>&1 || true
+
+  # 2) 杀掉所有 gost（不管是谁启动的）
+  pkill -9 gost >/dev/null 2>&1 || true
+
+  # 3) 清理旧配置目录
+  rm -rf /etc/nat-socks >/dev/null 2>&1 || true
+
+  # 4) 删除旧 systemd unit / wants 链接
+  rm -f /etc/systemd/system/nat-socks.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/multi-user.target.wants/nat-socks.service >/dev/null 2>&1 || true
+
+  # 5) 重新加载 systemd
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  # 6) 给系统一点时间释放端口
+  sleep 0.3
+
+  info "强制清理完成。"
+}
+
 # ---------- IPv6 出口检测（抗抖动） ----------
 check_ipv6_egress() {
-  # 逻辑：
-  # 1) 必须存在 IPv6 默认路由
-  # 2) ping6 通 -> 认为 IPv6 出口可用
-  # 3) ping6 不通时用 curl6 重试兜底
   if ! ip -6 route show default 2>/dev/null | grep -q '^default'; then
     IPV6_OK=0
     return 0
@@ -148,7 +157,6 @@ check_ipv6_egress() {
   fi
 }
 
-# ---------- 获取公网 IPv4 / IPv6 ----------
 get_public_ipv4() {
   local ip=""
   ip="$(curl -4 -fsS --max-time 8 https://ipinfo.io/ip 2>/dev/null | tr -d ' \r\n' || true)"
@@ -157,7 +165,7 @@ get_public_ipv4() {
   echo "$ip"
 }
 
-get_public_ipv6() {
+get_public_ipv6_external() {
   local ip6=""
   if [[ "${IPV6_OK}" -eq 1 ]]; then
     ip6="$(curl -6 -fsS --max-time 8 https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
@@ -165,7 +173,28 @@ get_public_ipv6() {
   echo "${ip6:-}"
 }
 
-# ---------- 写入 gost 配置（单监听双栈） ----------
+get_public_ipv6_local_all() {
+  # 只输出本机“已绑定”的 global IPv6（公网可直连）
+  # 排除：fe80 link-local / fdxx ULA / ::1
+  ip -6 addr show scope global 2>/dev/null \
+    | awk '/inet6/ {print $2}' \
+    | cut -d/ -f1 \
+    | grep -vE '^(fe80:|::1$)' \
+    | grep -vE '^fd' \
+    | sort -u
+}
+
+merge_ipv6_list() {
+  local local_list external_one
+  local_list="$(get_public_ipv6_local_all || true)"
+  external_one="$(get_public_ipv6_external || true)"
+
+  {
+    [[ -n "${local_list:-}" ]] && echo "$local_list"
+    [[ -n "${external_one:-}" ]] && echo "$external_one"
+  } | awk 'NF' | sort -u
+}
+
 write_gost_config() {
   mkdir -p /etc/nat-socks
 
@@ -177,7 +206,7 @@ write_gost_config() {
     warn "未检测到 IPv6 出口：代理解析优先走 IPv4。"
   fi
 
-  # ✅ 核心：只监听 [::]:PORT，避免 v4/v6 端口冲突（适配性最强）
+  # ✅ 关键：单监听 [::]:PORT（同时支持 IPv4 + IPv6，避免端口冲突）
   cat > /etc/nat-socks/gost.yaml <<EOF
 services:
   - name: nat-socks
@@ -200,7 +229,6 @@ EOF
   info "配置文件已写入：/etc/nat-socks/gost.yaml"
 }
 
-# ---------- systemd 服务 ----------
 write_systemd_service() {
   cat > /etc/systemd/system/nat-socks.service <<'EOF'
 [Unit]
@@ -225,44 +253,39 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
+  info "systemd 服务文件已写入：/etc/systemd/system/nat-socks.service"
 }
 
-# ---------- 强制应用配置：清理旧进程（解决 LXC 残留导致端口不变） ----------
-restart_clean() {
-  info "正在重启服务（强制清理旧 gost，避免端口残留）..."
-  systemctl stop nat-socks >/dev/null 2>&1 || true
-  pkill -9 gost >/dev/null 2>&1 || true
-
-  # 让 [::] 监听也能兼容 IPv4（多数系统默认 0，写一下更稳）
+start_service_fresh() {
+  # 让 [::] 监听兼容 IPv4（一般默认就是 0，这里强制更稳）
   sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
 
-  systemctl enable --now nat-socks >/dev/null 2>&1 || true
+  systemctl enable nat-socks >/dev/null 2>&1 || true
   systemctl start nat-socks >/dev/null 2>&1 || true
 }
 
-# ---------- 健康检查 ----------
-health_check() {
-  if ! systemctl is-active --quiet nat-socks; then
+assert_listening() {
+  # 强制检查：必须监听到你输入的端口，否则直接报错退出
+  # 兼容 ss 输出差异，这里只要出现 :PORT 就算监听成功
+  if ! ss -lnt 2>/dev/null | grep -qE "[:.]${SOCKS_PORT}\b"; then
     systemctl --no-pager -l status nat-socks || true
-    die "nat-socks 服务未正常运行。"
+    warn "当前监听列表："
+    ss -lntp 2>/dev/null || true
+    die "部署失败：未检测到端口 ${SOCKS_PORT} 正在监听。"
   fi
+}
 
-  # 确认端口监听（以 gost 进程为准）
-  if ! ss -lntp 2>/dev/null | grep -qE "gost.*:(${SOCKS_PORT})"; then
-    warn "未检测到 gost 正在监听端口 ${SOCKS_PORT}（可能 ss 输出不含进程名/权限限制）。"
-  fi
-
-  # 本机代理连通性快速测试（不依赖 ip.sb，避免 403）
+health_check_proxy() {
+  # 本机代理连通性（不用 ip.sb，避免 403）
   if ! curl -fsS --max-time 8 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org >/dev/null 2>&1; then
     systemctl --no-pager -l status nat-socks || true
     die "本机 SOCKS5 测试失败：无法通过代理访问外网。"
   fi
 }
 
-# ---------- 输出结果 ----------
 final_output() {
   local pub4="$1"
-  local pub6="$2"
+  local ipv6_list="$2"
 
   echo
   echo "${BOLD}================ 部署完成 ================${RESET}"
@@ -278,18 +301,21 @@ final_output() {
 
   echo
   echo "${GREEN}${BOLD}公网 IPv4：${pub4}${RESET}"
-  echo "${YELLOW}注意：NAT 小鸡的 IPv4 需要在服务商面板做端口映射：公网IPv4:外部端口 ---> 本机:${SOCKS_PORT}${RESET}"
+  echo "${YELLOW}注意：NAT 小鸡 IPv4 必须做端口映射：公网IPv4:外部端口 ---> 本机:${SOCKS_PORT}${RESET}"
   echo "${GREEN}${BOLD}IPv4 连接串（端口为示例，请换成 NAT 外部映射端口）：${RESET}"
   echo "${GREEN}${BOLD}socks5://${pub4}:${SOCKS_PORT}${RESET}"
   echo
 
-  if [[ -n "${pub6:-}" ]]; then
-    echo "${GREEN}${BOLD}公网 IPv6：${pub6}${RESET}"
-    echo "${GREEN}${BOLD}IPv6 连接串（一般无需 NAT 映射，直接可用）：${RESET}"
-    echo "${GREEN}${BOLD}socks5://[${pub6}]:${SOCKS_PORT}${RESET}"
-    echo "${YELLOW}提示：IPv6 在客户端里必须写成 socks5://[IPv6]:端口（IPv6 外面必须带 []）${RESET}"
+  if [[ -n "${ipv6_list:-}" ]]; then
+    echo "${GREEN}${BOLD}检测到以下公网 IPv6（可用于直连 SOCKS5）：${RESET}"
+    echo "${YELLOW}提示：IPv6 必须写成 socks5://[IPv6]:端口（IPv6 外面必须带 []）${RESET}"
+    echo
+    while IFS= read -r ip6; do
+      [[ -z "${ip6:-}" ]] && continue
+      echo "${GREEN}${BOLD}socks5://[${ip6}]:${SOCKS_PORT}${RESET}"
+    done <<< "$ipv6_list"
   else
-    echo "${YELLOW}未获取到公网 IPv6（可能机器没有 IPv6 出口或被限制）。${RESET}"
+    echo "${YELLOW}未检测到可用公网 IPv6（可能未绑定到网卡或被限制）。${RESET}"
   fi
 
   echo
@@ -306,20 +332,25 @@ main() {
   install_deps
   detect_arch
 
+  # ✅ 核心：先把历史部署全部清掉，再重新部署（强制覆盖）
+  force_cleanup_all
+
   check_ipv6_egress
   download_and_install_gost
 
   write_gost_config
   write_systemd_service
+  start_service_fresh
 
-  restart_clean
-  health_check
+  # ✅ 必须监听成功 + 代理可用，否则直接报错退出
+  assert_listening
+  health_check_proxy
 
-  local pub4 pub6
+  local pub4 ipv6_list
   pub4="$(get_public_ipv4)"
-  pub6="$(get_public_ipv6)"
+  ipv6_list="$(merge_ipv6_list || true)"
 
-  final_output "$pub4" "$pub6"
+  final_output "$pub4" "$ipv6_list"
 }
 
 main "$@"
