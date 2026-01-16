@@ -3,19 +3,19 @@
 # nat-socks.sh  (Debian/Ubuntu)
 # 一键部署 gost SOCKS5（无认证）——适配 NAT / IPv6-only / 低配 VPS
 #
-# ✅ 仅需输入一个参数：SOCKS5 内部监听端口
+# ✅ 只需输入一个参数：SOCKS5 内部监听端口
 # ✅ 强制覆盖安装：清理旧服务/旧进程/旧配置
-# ✅ 单监听 [::]:PORT（同时支持 IPv4+IPv6，避免 v4/v6 抢端口）
+# ✅ gost 单监听 [::]:PORT（同时支持 IPv4+IPv6，避免抢端口）
 # ✅ IPv6 优先解析策略（有 IPv6 出口时 prefer=ipv6）
-# ✅ 输出公网 IPv4 + 多个公网 IPv6 连接串
+# ✅ 输出公网 IPv4 + 多公网 IPv6 连接串
 # ✅ 自动安装 curl/wget/tar/ca-certificates/netcat-openbsd
 # ✅ 自动本机测试并输出结果 + “一键复制测试命令”
 #
 # ✅ 双重 fallback：
-#   - 版本获取：优先 releases/latest 跳转解析；失败 -> 固定版本 FALLBACK_TAG
-#   - 下载资产：优先 GitHub；失败 -> ghproxy 镜像
+#   - 版本获取：releases/latest 跳转解析；失败 -> 固定版本 FALLBACK_TAG
+#   - 下载资产：GitHub 下载失败 -> ghproxy 镜像
 #
-# ❗重要：完全不使用 api.github.com（很多机房连不上）
+# ❗完全不使用 api.github.com（很多机房连不上）
 # ============================================================
 
 set -euo pipefail
@@ -150,13 +150,12 @@ ask_port() {
 }
 
 # ============================================================
-# 4) 安装依赖（APT 强制 IPv6）
+# 4) 安装依赖（APT 可强制 IPv6）
 # ============================================================
 install_deps() {
   info "正在安装依赖（curl, wget, tar, ca-certificates, netcat-openbsd）..."
   export DEBIAN_FRONTEND=noninteractive
 
-  # apt update 偶发 timeout 不强制退出（你已经遇到过）
   if ! apt-get update -y "${APT_OPTS[@]}" >/dev/null 2>&1; then
     warn "apt-get update 出现超时/失败（常见于 IPv6-only/镜像抖动），继续尝试安装依赖..."
   fi
@@ -203,14 +202,12 @@ force_cleanup_all() {
 }
 
 # ============================================================
-# 7) 获取 gost 最新版本（不使用 api.github.com）
-#    双重 fallback：latest 跳转解析 -> 固定版本
+# 7) 获取 gost 版本（不使用 api.github.com）
 # ============================================================
 get_latest_gost_tag() {
   local latest_url="https://github.com/go-gost/gost/releases/latest"
   local loc tag
 
-  # 只解析 Location，不触碰 api.github.com
   loc="$(curl ${CURL_IPVER} -fsSLI "${latest_url}" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n1 | tr -d '\r' || true)"
   tag="$(echo "${loc:-}" | sed -n 's#.*tag/\(v[0-9.]\+\).*#\1#p' | head -n1 || true)"
 
@@ -224,7 +221,7 @@ get_latest_gost_tag() {
 }
 
 # ============================================================
-# 8) 下载 gost（二级 fallback：GitHub -> ghproxy）
+# 8) 下载并安装 gost（GitHub -> ghproxy fallback）
 # ============================================================
 download_and_install_gost() {
   local tag ver tarball url1 url2 tmpdir bin_path
@@ -241,25 +238,25 @@ download_and_install_gost() {
   info "下载地址(备)：${url2}"
 
   tmpdir="$(mktemp -d)"
-  trap '[[ -d "${tmpdir}" ]] && rm -rf "${tmpdir}"' EXIT
 
   if ! curl ${CURL_IPVER} -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 180 \
       -o "${tmpdir}/${tarball}" "${url1}" >/dev/null 2>&1; then
     warn "主下载失败，尝试备用镜像（ghproxy）..."
     curl ${CURL_IPVER} -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 \
       -o "${tmpdir}/${tarball}" "${url2}" >/dev/null 2>&1 \
-      || die "下载 gost 失败：GitHub 与 ghproxy 都不可用（检查网络/DNS/防火墙）。"
+      || { rm -rf "${tmpdir}" 2>/dev/null || true; die "下载 gost 失败：GitHub 与 ghproxy 都不可用"; }
   fi
 
   info "正在解压..."
-  tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}" || die "解压失败。"
+  tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}" || { rm -rf "${tmpdir}"; die "解压失败"; }
 
   bin_path="$(find "${tmpdir}" -maxdepth 3 -type f -name gost -perm -111 2>/dev/null | head -n1 || true)"
-  [[ -n "${bin_path:-}" ]] || die "解压后未找到 gost 可执行文件。"
+  [[ -n "${bin_path:-}" ]] || { rm -rf "${tmpdir}"; die "解压后未找到 gost 可执行文件"; }
 
   install -m 0755 "${bin_path}" "${INSTALL_BIN}"
-  "${INSTALL_BIN}" -V >/dev/null 2>&1 || die "gost 安装完成但运行失败。"
+  "${INSTALL_BIN}" -V >/dev/null 2>&1 || { rm -rf "${tmpdir}"; die "gost 安装后运行失败"; }
 
+  rm -rf "${tmpdir}" 2>/dev/null || true
   ok "已安装 gost：${INSTALL_BIN}"
 }
 
@@ -382,8 +379,8 @@ get_public_ipv6_http() {
   echo "${ip6:-}"
 }
 
-get_ipv6_global_on_iface() {
-  # 取 scope global 的 IPv6，过滤 ULA(fdxx) 与 link-local(fe80)
+get_ipv6_global_all() {
+  # 收集所有网卡的 global IPv6（排除 fe80 / fdxx / ::1）
   ip -6 addr show scope global 2>/dev/null \
     | awk '/inet6/ {print $2}' \
     | cut -d/ -f1 \
@@ -393,10 +390,14 @@ get_ipv6_global_on_iface() {
 }
 
 merge_ipv6_list() {
-  local a b
-  a="$(get_ipv6_global_on_iface)"
-  b="$(get_public_ipv6_http)"
-  { [[ -n "${a:-}" ]] && echo "${a}"; [[ -n "${b:-}" ]] && echo "${b}"; } | awk 'NF' | sort -u
+  local iface_list http_one
+  iface_list="$(get_ipv6_global_all)"
+  http_one="$(get_public_ipv6_http)"
+
+  {
+    [[ -n "${iface_list:-}" ]] && echo "${iface_list}"
+    [[ -n "${http_one:-}" ]] && echo "${http_one}"
+  } | awk 'NF' | sort -u
 }
 
 # ============================================================
@@ -414,7 +415,7 @@ run_local_tests() {
 
   local out4=""
   out4="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null || true)"
-  [[ -n "${out4:-}" ]] && ok "SOCKS5 -> IPv4 出口：通（出口 IPv4 = ${out4}）" || warn "SOCKS5 -> IPv4 出口：不通（IPv6-only 某些环境可能正常）"
+  [[ -n "${out4:-}" ]] && ok "SOCKS5 -> IPv4 出口：通（出口 IPv4 = ${out4}）" || warn "SOCKS5 -> IPv4 出口：不通（IPv6-only 环境可能正常）"
 
   local out6=""
   out6="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
@@ -428,8 +429,37 @@ run_local_tests() {
 }
 
 # ============================================================
-# 14) 最终输出：连接串 + 一键复制测试命令
+# 14) 输出：连接串 + 一键复制测试命令 + 绑定 IPv6 提示
 # ============================================================
+print_ipv6_bind_hint_if_needed() {
+  # 如果系统没有任何公网 IPv6（只有 fdxx/fe80），但 curl -6 能拿到公网 IPv6
+  # 说明：面板可能分配了公网 IPv6，但系统未绑定。输出提示。
+  local iface_list http_one
+  iface_list="$(get_ipv6_global_all)"
+  http_one="$(get_public_ipv6_http)"
+
+  if [[ -z "${iface_list:-}" && -n "${http_one:-}" ]]; then
+    echo
+    warn "检测到：系统网卡未绑定任何公网 IPv6（只有 ULA 内网 fdxx），但 IPv6 出口存在。"
+    echo "${YELLOW}这通常表示：服务商面板分配了公网 IPv6，但你需要手动把它们绑定到网卡。${RESET}"
+    echo
+    echo "${BOLD}你可以参考下面格式（把面板里的 IPv6 全部 add 上去）：${RESET}"
+    cat <<'EOF'
+# 假设网卡是 eth0，面板给了 3 个公网 IPv6：
+# 2001:470:1c:3a1::2f2
+# 2001:470:1c:3a1::21e
+# 2001:470:1c:3a1::30f
+
+ip -6 addr add 2001:470:1c:3a1::2f2/128 dev eth0
+ip -6 addr add 2001:470:1c:3a1::21e/128 dev eth0
+ip -6 addr add 2001:470:1c:3a1::30f/128 dev eth0
+
+systemctl restart nat-socks
+ip -6 addr show scope global
+EOF
+  fi
+}
+
 final_output() {
   local pub4="$1"
   local ipv6_list="$2"
@@ -466,8 +496,10 @@ final_output() {
       echo "${GREEN}${BOLD}socks5://[${ip6}]:${SOCKS_PORT}${RESET}"
     done <<< "${ipv6_list}"
   else
-    warn "未检测到可用公网 IPv6（可能只有内网 ULA(fdxx) 或未开放入站）"
+    warn "未检测到网卡绑定的公网 IPv6（可能只绑定了 ULA(fdxx) 或未配置 /128）。"
   fi
+
+  print_ipv6_bind_hint_if_needed
 
   echo
   echo "${BOLD}================ 一键复制测试命令 ================${RESET}"
