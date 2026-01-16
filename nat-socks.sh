@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 # ============================================================
 # nat-socks.sh  (Debian/Ubuntu)
-# 一键部署 gost SOCKS5（无认证），适配 NAT / IPv6-only / 低配 VPS
+# 一键部署 gost SOCKS5（无认证）——适配 NAT / IPv6-only / 低配 VPS
 #
+# ✅ 仅需输入一个参数：SOCKS5 内部监听端口
 # ✅ 强制覆盖安装：清理旧服务/旧进程/旧配置
-# ✅ 只输入一个参数：内部监听端口
-# ✅ 单监听 [::]:PORT（同时支持 IPv4 + IPv6，避免端口冲突）
+# ✅ 单监听 [::]:PORT（同时支持 IPv4+IPv6，避免 v4/v6 抢端口）
 # ✅ IPv6 优先解析策略（有 IPv6 出口时 prefer=ipv6）
 # ✅ 输出公网 IPv4 + 多个公网 IPv6 连接串
-# ✅ 自动安装依赖：curl/wget/tar/ca-certificates/netcat-openbsd
-# ✅ 自动本机测试并打印结果
+# ✅ 自动安装 curl/wget/tar/ca-certificates/netcat-openbsd
+# ✅ 自动本机测试并输出结果 + “一键复制测试命令”
 #
 # ✅ 双重 fallback：
-#   - 获取版本：优先 latest 跳转解析；失败 -> 固定版本 FALLBACK_TAG
+#   - 版本获取：优先 releases/latest 跳转解析；失败 -> 固定版本 FALLBACK_TAG
 #   - 下载资产：优先 GitHub；失败 -> ghproxy 镜像
+#
+# ❗重要：完全不使用 api.github.com（很多机房连不上）
 # ============================================================
 
 set -euo pipefail
 
 # ------------------ 可改参数 ------------------
-FALLBACK_TAG="v3.2.6"     # 如果 latest 解析失败，就用这个版本兜底（可改）
+FALLBACK_TAG="v3.2.6"     # latest 解析失败就用它兜底（可改）
 SERVICE_NAME="nat-socks"
 INSTALL_BIN="/usr/local/bin/gost"
 CONF_DIR="/etc/nat-socks"
@@ -46,10 +48,8 @@ need_root() {
   fi
 }
 
-cmd_exists() { command -v "$1" >/dev/null 2>&1; }
-
 # ============================================================
-# 1) 网络环境判断：IPv4/IPv6 是否有默认路由 -> 决定 curl/apt 是否强制走 IPv6
+# 1) 网络栈检测：决定 curl/apt 是否强制走 IPv6
 # ============================================================
 IPV4_OK=0
 IPV6_OK=0
@@ -81,22 +81,19 @@ detect_stack() {
 }
 
 # ============================================================
-# 2) DNS 自愈（适配你这种 /etc/resolv.conf 缺失或解析抖动的 NAT 小鸡）
+# 2) DNS 自愈（针对 /etc/resolv.conf 缺失 / 解析抖动）
 # ============================================================
 ensure_dns_basics() {
-  # 修 hosts，避免 sudo: unable to resolve host
   local hn
   hn="$(hostname 2>/dev/null || true)"
-  if [[ -n "${hn:-}" ]] && ! grep -qE "127\.0\.1\.1[[:space:]]+${hn}" /etc/hosts 2>/dev/null; then
-    echo "127.0.1.1 ${hn}" >> /etc/hosts 2>/dev/null || true
+  if [[ -n "${hn:-}" ]] && [[ -f /etc/hosts ]]; then
+    grep -qE "127\.0\.1\.1[[:space:]]+${hn}" /etc/hosts 2>/dev/null || echo "127.0.1.1 ${hn}" >> /etc/hosts 2>/dev/null || true
   fi
 
-  # 保证 nsswitch.conf 优先 files + dns
   if [[ -f /etc/nsswitch.conf ]]; then
     sed -i 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf 2>/dev/null || true
   fi
 
-  # 没有 resolv.conf 就补一个（优先 IPv6 DNS）
   if [[ ! -f /etc/resolv.conf ]]; then
     warn "/etc/resolv.conf 不存在，自动写入 DNS（优先 IPv6 DNS）"
     mkdir -p /etc
@@ -111,7 +108,6 @@ EOF
 }
 
 dns_probe_or_fix() {
-  # 若解析 github.com 失败，尝试重写 resolv.conf（常见：IPv6-only 缺 DNS）
   if ! getent hosts github.com >/dev/null 2>&1; then
     warn "检测到 DNS 解析异常，尝试修复 /etc/resolv.conf ..."
     mkdir -p /etc
@@ -128,18 +124,25 @@ EOF
   if getent hosts github.com >/dev/null 2>&1; then
     ok "DNS 解析正常（github.com 可解析）"
   else
-    warn "DNS 仍可能不稳定（github.com 解析失败）。若后续下载失败，请再次检查 DNS/网络。"
+    warn "DNS 仍可能不稳定（github.com 解析失败）。后续若下载失败，请重点检查 DNS/网络。"
   fi
 }
 
 # ============================================================
-# 3) 输入端口（唯一交互）
+# 3) 输入端口（兼容 | bash：从 /dev/tty 读取）
 # ============================================================
 ask_port() {
   local p=""
   echo
   echo "请输入 SOCKS5 监听端口（这是 VPS 内部端口，不是 NAT 外部映射端口）"
-  read -r -p "SOCKS5 内部监听端口 (1-65535): " p
+
+  if [[ -t 0 ]]; then
+    read -r -p "SOCKS5 内部监听端口 (1-65535): " p
+  else
+    [[ -e /dev/tty ]] || die "当前环境无法交互输入（/dev/tty 不存在）。请先下载脚本再运行：wget -O nat-socks.sh ... && bash nat-socks.sh"
+    read -r -p "SOCKS5 内部监听端口 (1-65535): " p < /dev/tty
+  fi
+
   p="$(echo "$p" | tr -d ' \t\r\n')"
   [[ "$p" =~ ^[0-9]+$ ]] || die "端口必须是数字。"
   (( p >= 1 && p <= 65535 )) || die "端口范围必须是 1-65535。"
@@ -147,13 +150,13 @@ ask_port() {
 }
 
 # ============================================================
-# 4) 依赖安装（自动装 nc）
+# 4) 安装依赖（APT 强制 IPv6）
 # ============================================================
 install_deps() {
   info "正在安装依赖（curl, wget, tar, ca-certificates, netcat-openbsd）..."
   export DEBIAN_FRONTEND=noninteractive
 
-  # apt update 可能偶发 timeout（IPv6-only 镜像抖动），这里不强制失败退出
+  # apt update 偶发 timeout 不强制退出（你已经遇到过）
   if ! apt-get update -y "${APT_OPTS[@]}" >/dev/null 2>&1; then
     warn "apt-get update 出现超时/失败（常见于 IPv6-only/镜像抖动），继续尝试安装依赖..."
   fi
@@ -161,6 +164,7 @@ install_deps() {
   if ! apt-get install -y curl wget tar ca-certificates netcat-openbsd "${APT_OPTS[@]}" >/dev/null 2>&1; then
     die "依赖安装失败：请检查网络/镜像后重试。"
   fi
+
   ok "依赖已就绪（含 nc 测试工具）"
 }
 
@@ -179,13 +183,12 @@ detect_arch() {
 }
 
 # ============================================================
-# 6) 强制清理旧残留（无论部署过多少次都能覆盖）
+# 6) 强制清理旧残留（确保可覆盖安装）
 # ============================================================
 force_cleanup_all() {
   info "开始强制清理历史残留（旧进程/旧服务/旧配置）..."
   systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-
   pkill -9 gost >/dev/null 2>&1 || true
 
   rm -rf "${CONF_DIR}" >/dev/null 2>&1 || true
@@ -200,14 +203,14 @@ force_cleanup_all() {
 }
 
 # ============================================================
-# 7) 获取 gost 最新版本（双重 fallback：latest -> 固定版本）
-#    说明：不用 api.github.com（你的机房经常连不上）
+# 7) 获取 gost 最新版本（不使用 api.github.com）
+#    双重 fallback：latest 跳转解析 -> 固定版本
 # ============================================================
 get_latest_gost_tag() {
   local latest_url="https://github.com/go-gost/gost/releases/latest"
   local loc tag
 
-  # 这里用 -I 拿跳转 Location，避免 api.github.com
+  # 只解析 Location，不触碰 api.github.com
   loc="$(curl ${CURL_IPVER} -fsSLI "${latest_url}" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tail -n1 | tr -d '\r' || true)"
   tag="$(echo "${loc:-}" | sed -n 's#.*tag/\(v[0-9.]\+\).*#\1#p' | head -n1 || true)"
 
@@ -216,13 +219,12 @@ get_latest_gost_tag() {
     return 0
   fi
 
-  # fallback 固定版本
-  warn "无法通过 latest 跳转解析 gost 最新版本，使用 fallback 版本：${FALLBACK_TAG}"
+  warn "无法通过 releases/latest 解析版本，使用 fallback 版本：${FALLBACK_TAG}"
   echo "${FALLBACK_TAG}"
 }
 
 # ============================================================
-# 8) 下载 gost（双重 fallback：GitHub -> ghproxy）
+# 8) 下载 gost（二级 fallback：GitHub -> ghproxy）
 # ============================================================
 download_and_install_gost() {
   local tag ver tarball url1 url2 tmpdir bin_path
@@ -232,7 +234,7 @@ download_and_install_gost() {
   tarball="gost_${ver}_linux_${GOST_ARCH}.tar.gz"
 
   url1="https://github.com/go-gost/gost/releases/download/${tag}/${tarball}"
-  url2="https://ghproxy.com/${url1}"   # 镜像加速兜底
+  url2="https://ghproxy.com/${url1}"
 
   info "gost 目标版本：${tag}"
   info "下载地址(主)：${url1}"
@@ -241,13 +243,12 @@ download_and_install_gost() {
   tmpdir="$(mktemp -d)"
   trap '[[ -d "${tmpdir}" ]] && rm -rf "${tmpdir}"' EXIT
 
-  # 尝试主下载
   if ! curl ${CURL_IPVER} -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 180 \
       -o "${tmpdir}/${tarball}" "${url1}" >/dev/null 2>&1; then
-    warn "主下载失败，尝试备用镜像下载（ghproxy）..."
+    warn "主下载失败，尝试备用镜像（ghproxy）..."
     curl ${CURL_IPVER} -fL --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 240 \
       -o "${tmpdir}/${tarball}" "${url2}" >/dev/null 2>&1 \
-      || die "下载 gost 失败：GitHub 与镜像都不可用（检查网络/DNS/防火墙）。"
+      || die "下载 gost 失败：GitHub 与 ghproxy 都不可用（检查网络/DNS/防火墙）。"
   fi
 
   info "正在解压..."
@@ -263,7 +264,7 @@ download_and_install_gost() {
 }
 
 # ============================================================
-# 9) IPv6 出口检测（用于 resolver prefer）
+# 9) IPv6 出口检测（用于 prefer=ipv6）
 # ============================================================
 IPV6_EGRESS=0
 check_ipv6_egress() {
@@ -370,20 +371,19 @@ assert_listening() {
 # ============================================================
 get_public_ipv4() {
   local ip=""
-  # NAT 小鸡一般有公网 IPv4（但网卡上是内网），因此必须外部查询
   ip="$(curl ${CURL_IPVER} -4 -fsS --max-time 8 https://ipinfo.io/ip 2>/dev/null | tr -d ' \r\n' || true)"
   [[ -n "${ip:-}" ]] || ip="$(curl ${CURL_IPVER} -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null | tr -d ' \r\n' || true)"
   echo "${ip:-}"
 }
 
-get_public_ipv6_via_http() {
+get_public_ipv6_http() {
   local ip6=""
   ip6="$(curl ${CURL_IPVER} -6 -fsS --max-time 8 https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
   echo "${ip6:-}"
 }
 
-get_ipv6_on_iface() {
-  # 输出 scope global 的 IPv6，过滤 ULA(fdxx) 与 link-local(fe80)
+get_ipv6_global_on_iface() {
+  # 取 scope global 的 IPv6，过滤 ULA(fdxx) 与 link-local(fe80)
   ip -6 addr show scope global 2>/dev/null \
     | awk '/inet6/ {print $2}' \
     | cut -d/ -f1 \
@@ -393,17 +393,14 @@ get_ipv6_on_iface() {
 }
 
 merge_ipv6_list() {
-  local local_list http_one
-  local_list="$(get_ipv6_on_iface)"
-  http_one="$(get_public_ipv6_via_http)"
-  {
-    [[ -n "${local_list:-}" ]] && echo "${local_list}"
-    [[ -n "${http_one:-}" ]] && echo "${http_one}"
-  } | awk 'NF' | sort -u
+  local a b
+  a="$(get_ipv6_global_on_iface)"
+  b="$(get_public_ipv6_http)"
+  { [[ -n "${a:-}" ]] && echo "${a}"; [[ -n "${b:-}" ]] && echo "${b}"; } | awk 'NF' | sort -u
 }
 
 # ============================================================
-# 13) 本机自动测试（直接输出结果）
+# 13) 本机自动测试并输出结果
 # ============================================================
 run_local_tests() {
   echo
@@ -415,34 +412,23 @@ run_local_tests() {
     die "监听检测失败：端口 ${SOCKS_PORT} 未监听"
   fi
 
-  # 测试 SOCKS5 IPv4 出口（哪怕 IPv4-only 也可以通过代理访问 IPv4 网站）
   local out4=""
   out4="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null || true)"
-  if [[ -n "${out4:-}" ]]; then
-    ok "SOCKS5 -> IPv4 出口：通（出口 IPv4 = ${out4}）"
-  else
-    warn "SOCKS5 -> IPv4 出口：不通（某些 IPv6-only 环境可能正常）"
-  fi
+  [[ -n "${out4:-}" ]] && ok "SOCKS5 -> IPv4 出口：通（出口 IPv4 = ${out4}）" || warn "SOCKS5 -> IPv4 出口：不通（IPv6-only 某些环境可能正常）"
 
-  # 测试 SOCKS5 IPv6 出口
   local out6=""
   out6="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
-  if [[ -n "${out6:-}" ]]; then
-    ok "SOCKS5 -> IPv6 出口：通（出口 IPv6 = ${out6}）"
-  else
-    warn "SOCKS5 -> IPv6 出口：不通（目标站点或出口策略不同）"
-  fi
+  [[ -n "${out6:-}" ]] && ok "SOCKS5 -> IPv6 出口：通（出口 IPv6 = ${out6}）" || warn "SOCKS5 -> IPv6 出口：不通"
 
-  # nc 本机端口测试
   if nc -vz 127.0.0.1 "${SOCKS_PORT}" >/dev/null 2>&1; then
     ok "nc 本机端口测试：通（127.0.0.1:${SOCKS_PORT}）"
   else
-    warn "nc 本机端口测试：不通（通常不影响 SOCKS5 可用性）"
+    warn "nc 本机端口测试：不通"
   fi
 }
 
 # ============================================================
-# 14) 最终输出（连接串 + 一键复制测试命令）
+# 14) 最终输出：连接串 + 一键复制测试命令
 # ============================================================
 final_output() {
   local pub4="$1"
