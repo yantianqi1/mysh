@@ -17,3 +17,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/nat-soc
 
 only-ipv6
 bash <(curl -6 -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/nat-socks.sh)
+
+强制ipv4
+bash <(curl -4 -fsSL https://raw.githubusercontent.com/yantianqi1/mysh/main/nat-socks.sh)
