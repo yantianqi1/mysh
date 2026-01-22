@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
 # nat-socks.sh  (Debian/Ubuntu)
-# 一键部署 gost SOCKS5（无认证）——适配 NAT / IPv6-only / 低配 VPS
+# 一键部署 gost SOCKS5 + HTTP 代理（无认证）——适配 NAT / IPv6-only / 低配 VPS
 #
 # ✅ 只需输入一个参数：SOCKS5 内部监听端口
+# ✅ HTTP 代理端口自动生成：SOCKS5端口 + 1
 # ✅ 强制覆盖安装：清理旧服务/旧进程/旧配置
-# ✅ gost 单监听 [::]:PORT（同时支持 IPv4+IPv6，避免抢端口）
+# ✅ gost 单监听双栈 [::]:PORT（同时支持 IPv4+IPv6）
 # ✅ IPv6 优先解析策略（有 IPv6 出口时 prefer=ipv6）
-# ✅ 输出公网 IPv4 + 多公网 IPv6 连接串
-# ✅ 自动安装 curl/wget/tar/ca-certificates/netcat-openbsd
-# ✅ 自动本机测试并输出结果 + “一键复制测试命令”
-#
+# ✅ 输出公网 IPv4 + 多公网 IPv6 连接串（SOCKS5 + HTTP）
+# ✅ 自动安装依赖：curl/wget/tar/ca-certificates/netcat-openbsd
+#    - APT 超时不轻易退出：curl+tar 存在则继续部署
 # ✅ 双重 fallback：
-#   - 版本获取：releases/latest 跳转解析；失败 -> 固定版本 FALLBACK_TAG
-#   - 下载资产：GitHub 下载失败 -> ghproxy 镜像
+#    - 版本获取：releases/latest 跳转解析；失败 -> FALLBACK_TAG
+#    - 下载资产：GitHub 下载失败 -> ghproxy 镜像
 #
-# ❗完全不使用 api.github.com（很多机房连不上）
+# 服务名：nat-socks
 # ============================================================
 
 set -euo pipefail
@@ -147,24 +147,56 @@ ask_port() {
   [[ "$p" =~ ^[0-9]+$ ]] || die "端口必须是数字。"
   (( p >= 1 && p <= 65535 )) || die "端口范围必须是 1-65535。"
   SOCKS_PORT="$p"
+
+  # ✅ HTTP 代理端口自动生成（不新增交互）
+  HTTP_PORT=$((SOCKS_PORT + 1))
+  if (( HTTP_PORT > 65535 )); then
+    die "HTTP 端口自动生成失败（SOCKS5端口+1 超过 65535），请换个 SOCKS5 端口。"
+  fi
 }
 
 # ============================================================
-# 4) 安装依赖（APT 可强制 IPv6）
+# 4) 安装依赖（APT 超时兜底：curl+tar 存在则继续）
 # ============================================================
 install_deps() {
   info "正在安装依赖（curl, wget, tar, ca-certificates, netcat-openbsd）..."
   export DEBIAN_FRONTEND=noninteractive
 
-  if ! apt-get update -y "${APT_OPTS[@]}" >/dev/null 2>&1; then
-    warn "apt-get update 出现超时/失败（常见于 IPv6-only/镜像抖动），继续尝试安装依赖..."
+  local need_pkgs=()
+  command -v curl >/dev/null 2>&1 || need_pkgs+=("curl")
+  command -v wget >/dev/null 2>&1 || need_pkgs+=("wget")
+  command -v tar  >/dev/null 2>&1 || need_pkgs+=("tar")
+  command -v nc   >/dev/null 2>&1 || need_pkgs+=("netcat-openbsd")
+  [[ -f /etc/ssl/certs/ca-certificates.crt ]] || need_pkgs+=("ca-certificates")
+
+  if [[ "${#need_pkgs[@]}" -eq 0 ]]; then
+    ok "依赖已存在，跳过 apt 安装。"
+    return 0
   fi
 
-  if ! apt-get install -y curl wget tar ca-certificates netcat-openbsd "${APT_OPTS[@]}" >/dev/null 2>&1; then
-    die "依赖安装失败：请检查网络/镜像后重试。"
+  local APT_STABLE_OPTS=(
+    "-o" "Acquire::Retries=2"
+    "-o" "Acquire::http::Timeout=12"
+    "-o" "Acquire::https::Timeout=12"
+  )
+
+  if ! apt-get update -y "${APT_OPTS[@]}" "${APT_STABLE_OPTS[@]}" >/dev/null 2>&1; then
+    warn "apt-get update 出现超时/失败（IPv6-only 常见），继续尝试安装依赖..."
   fi
 
-  ok "依赖已就绪（含 nc 测试工具）"
+  if apt-get install -y "${need_pkgs[@]}" "${APT_OPTS[@]}" "${APT_STABLE_OPTS[@]}" >/dev/null 2>&1; then
+    ok "依赖已就绪（含 nc 测试工具）"
+    return 0
+  fi
+
+  warn "依赖安装失败（很可能是 IPv6-only 到 apt 镜像不通/超时）"
+
+  if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    warn "但检测到 curl/tar 已存在：继续部署（缺的工具会跳过，例如 nc 本机端口测试将跳过）"
+    return 0
+  fi
+
+  die "依赖安装失败且缺少 curl/tar：无法继续。请先修复 apt 源/网络后重试。"
 }
 
 # ============================================================
@@ -274,7 +306,7 @@ check_ipv6_egress() {
 }
 
 # ============================================================
-# 10) 写 gost 配置（单监听双栈）
+# 10) 写 gost 配置（SOCKS5 + HTTP 两个服务）
 # ============================================================
 write_gost_config() {
   mkdir -p "${CONF_DIR}"
@@ -289,10 +321,20 @@ write_gost_config() {
 
   cat > "${CONF_FILE}" <<EOF
 services:
-  - name: ${SERVICE_NAME}
+  # SOCKS5 代理（无认证）
+  - name: ${SERVICE_NAME}-socks5
     addr: "[::]:${SOCKS_PORT}"
     handler:
       type: socks5
+    listener:
+      type: tcp
+    resolver: resolver-0
+
+  # HTTP/HTTPS Forward Proxy（无认证）
+  - name: ${SERVICE_NAME}-http
+    addr: "[::]:${HTTP_PORT}"
+    handler:
+      type: http
     listener:
       type: tcp
     resolver: resolver-0
@@ -315,7 +357,7 @@ EOF
 write_systemd_service() {
   cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
-Description=${SERVICE_NAME} (SOCKS5 proxy via gost)
+Description=${SERVICE_NAME} (SOCKS5+HTTP proxy via gost)
 After=network-online.target
 Wants=network-online.target
 
@@ -340,10 +382,11 @@ start_service_fresh() {
   systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
-wait_listening() {
+wait_listening_port() {
+  local port="$1"
   local i
   for i in $(seq 1 40); do
-    if ss -lnt 2>/dev/null | grep -qE "[:.]${SOCKS_PORT}\b"; then
+    if ss -lnt 2>/dev/null | grep -qE "[:.]${port}\b"; then
       return 0
     fi
     sleep 0.1
@@ -352,15 +395,15 @@ wait_listening() {
 }
 
 assert_listening() {
-  if wait_listening; then
-    ok "已检测到端口 ${SOCKS_PORT} 正在监听。"
+  if wait_listening_port "${SOCKS_PORT}" && wait_listening_port "${HTTP_PORT}"; then
+    ok "已检测到端口 ${SOCKS_PORT}(SOCKS5) 与 ${HTTP_PORT}(HTTP) 正在监听。"
     return 0
   fi
 
   warn "监听检测失败，输出服务状态/日志协助排错："
   systemctl --no-pager -l status "${SERVICE_NAME}" || true
   journalctl -u "${SERVICE_NAME}" -n 80 --no-pager || true
-  die "部署失败：未检测到端口 ${SOCKS_PORT} 正在监听。"
+  die "部署失败：未检测到端口监听（SOCKS5=${SOCKS_PORT}, HTTP=${HTTP_PORT}）"
 }
 
 # ============================================================
@@ -380,7 +423,6 @@ get_public_ipv6_http() {
 }
 
 get_ipv6_global_all() {
-  # 收集所有网卡的 global IPv6（排除 fe80 / fdxx / ::1）
   ip -6 addr show scope global 2>/dev/null \
     | awk '/inet6/ {print $2}' \
     | cut -d/ -f1 \
@@ -401,65 +443,40 @@ merge_ipv6_list() {
 }
 
 # ============================================================
-# 13) 本机自动测试并输出结果
+# 13) 本机自动测试（SOCKS5 + HTTP）并输出结果
 # ============================================================
 run_local_tests() {
   echo
   echo "${BOLD}================ 本机自动测试 ================${RESET}"
 
-  if ss -lnt 2>/dev/null | grep -qE "[:.]${SOCKS_PORT}\b"; then
-    ok "监听检测：端口 ${SOCKS_PORT} 已监听"
+  # SOCKS5 测 IPv4/IPv6
+  local s4 s6
+  s4="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "${s4:-}" ]] && ok "SOCKS5 -> IPv4 出口：通（${s4}）" || warn "SOCKS5 -> IPv4 出口：不通（IPv6-only 环境可能正常）"
+
+  s6="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
+  [[ -n "${s6:-}" ]] && ok "SOCKS5 -> IPv6 出口：通（${s6}）" || warn "SOCKS5 -> IPv6 出口：不通"
+
+  # HTTP 测 IPv4/IPv6（HTTP forward proxy）
+  local h4 h6
+  h4="$(curl -fsS --max-time 10 -x "http://127.0.0.1:${HTTP_PORT}" https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "${h4:-}" ]] && ok "HTTP -> IPv4 出口：通（${h4}）" || warn "HTTP -> IPv4 出口：不通（IPv6-only 环境可能正常）"
+
+  h6="$(curl -fsS --max-time 10 -x "http://127.0.0.1:${HTTP_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
+  [[ -n "${h6:-}" ]] && ok "HTTP -> IPv6 出口：通（${h6}）" || warn "HTTP -> IPv6 出口：不通"
+
+  # nc 端口测试
+  if command -v nc >/dev/null 2>&1; then
+    nc -vz 127.0.0.1 "${SOCKS_PORT}" >/dev/null 2>&1 && ok "nc 端口检测：SOCKS5 通（127.0.0.1:${SOCKS_PORT}）" || warn "nc 端口检测：SOCKS5 不通"
+    nc -vz 127.0.0.1 "${HTTP_PORT}"  >/dev/null 2>&1 && ok "nc 端口检测：HTTP 通（127.0.0.1:${HTTP_PORT}）"  || warn "nc 端口检测：HTTP 不通"
   else
-    die "监听检测失败：端口 ${SOCKS_PORT} 未监听"
-  fi
-
-  local out4=""
-  out4="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://api.ipify.org 2>/dev/null || true)"
-  [[ -n "${out4:-}" ]] && ok "SOCKS5 -> IPv4 出口：通（出口 IPv4 = ${out4}）" || warn "SOCKS5 -> IPv4 出口：不通（IPv6-only 环境可能正常）"
-
-  local out6=""
-  out6="$(curl -fsS --max-time 10 -x "socks5h://127.0.0.1:${SOCKS_PORT}" https://ipv6.icanhazip.com 2>/dev/null | tr -d ' \r\n' || true)"
-  [[ -n "${out6:-}" ]] && ok "SOCKS5 -> IPv6 出口：通（出口 IPv6 = ${out6}）" || warn "SOCKS5 -> IPv6 出口：不通"
-
-  if nc -vz 127.0.0.1 "${SOCKS_PORT}" >/dev/null 2>&1; then
-    ok "nc 本机端口测试：通（127.0.0.1:${SOCKS_PORT}）"
-  else
-    warn "nc 本机端口测试：不通"
+    warn "nc 未安装：跳过 nc 端口测试（不影响使用）"
   fi
 }
 
 # ============================================================
-# 14) 输出：连接串 + 一键复制测试命令 + 绑定 IPv6 提示
+# 14) 最终输出（SOCKS5 + HTTP 两种连接串）
 # ============================================================
-print_ipv6_bind_hint_if_needed() {
-  # 如果系统没有任何公网 IPv6（只有 fdxx/fe80），但 curl -6 能拿到公网 IPv6
-  # 说明：面板可能分配了公网 IPv6，但系统未绑定。输出提示。
-  local iface_list http_one
-  iface_list="$(get_ipv6_global_all)"
-  http_one="$(get_public_ipv6_http)"
-
-  if [[ -z "${iface_list:-}" && -n "${http_one:-}" ]]; then
-    echo
-    warn "检测到：系统网卡未绑定任何公网 IPv6（只有 ULA 内网 fdxx），但 IPv6 出口存在。"
-    echo "${YELLOW}这通常表示：服务商面板分配了公网 IPv6，但你需要手动把它们绑定到网卡。${RESET}"
-    echo
-    echo "${BOLD}你可以参考下面格式（把面板里的 IPv6 全部 add 上去）：${RESET}"
-    cat <<'EOF'
-# 假设网卡是 eth0，面板给了 3 个公网 IPv6：
-# 2001:470:1c:3a1::2f2
-# 2001:470:1c:3a1::21e
-# 2001:470:1c:3a1::30f
-
-ip -6 addr add 2001:470:1c:3a1::2f2/128 dev eth0
-ip -6 addr add 2001:470:1c:3a1::21e/128 dev eth0
-ip -6 addr add 2001:470:1c:3a1::30f/128 dev eth0
-
-systemctl restart nat-socks
-ip -6 addr show scope global
-EOF
-  fi
-}
-
 final_output() {
   local pub4="$1"
   local ipv6_list="$2"
@@ -467,7 +484,7 @@ final_output() {
   echo
   echo "${BOLD}================ 部署完成 ================${RESET}"
   echo "服务名称：${SERVICE_NAME}（systemd）"
-  echo "内部监听端口（VPS 内部端口）：${SOCKS_PORT}"
+  echo "内部监听端口：SOCKS5=${SOCKS_PORT} / HTTP=${HTTP_PORT}"
   echo
 
   if [[ "${IPV6_EGRESS}" -eq 1 ]]; then
@@ -479,39 +496,50 @@ final_output() {
   echo
   if [[ -n "${pub4:-}" ]]; then
     echo "${GREEN}${BOLD}公网 IPv4：${pub4}${RESET}"
-    echo "${YELLOW}注意：NAT 小鸡 IPv4 必须做端口映射：公网IPv4:外部端口 ---> 本机:${SOCKS_PORT}${RESET}"
+    echo "${YELLOW}注意：NAT 小鸡 IPv4 必须做端口映射：公网IPv4:外部端口 ---> 本机:${SOCKS_PORT}(SOCKS5) / ${HTTP_PORT}(HTTP)${RESET}"
+    echo
+
     echo "${GREEN}${BOLD}IPv4 连接串（端口为示例，请换成 NAT 外部映射端口）：${RESET}"
-    echo "${GREEN}${BOLD}socks5://${pub4}:${SOCKS_PORT}${RESET}"
+    echo "${GREEN}${BOLD}SOCKS5: socks5://${pub4}:${SOCKS_PORT}${RESET}"
+    echo "${GREEN}${BOLD}HTTP  : http://${pub4}:${HTTP_PORT}${RESET}"
   else
     warn "未获取到公网 IPv4（IPv6-only 环境可能正常）"
   fi
 
   echo
   if [[ -n "${ipv6_list:-}" ]]; then
-    echo "${GREEN}${BOLD}检测到以下公网 IPv6（可用于直连 SOCKS5）：${RESET}"
-    echo "${YELLOW}提示：IPv6 必须写成 socks5://[IPv6]:端口（IPv6 外面必须带 []）${RESET}"
+    echo "${GREEN}${BOLD}检测到以下公网 IPv6（可用于直连代理）：${RESET}"
+    echo "${YELLOW}提示：IPv6 必须写成 [IPv6]（外面必须带 []）${RESET}"
     echo
     while IFS= read -r ip6; do
       [[ -z "${ip6:-}" ]] && continue
-      echo "${GREEN}${BOLD}socks5://[${ip6}]:${SOCKS_PORT}${RESET}"
+      echo "${GREEN}${BOLD}SOCKS5: socks5://[${ip6}]:${SOCKS_PORT}${RESET}"
+      echo "${GREEN}${BOLD}HTTP  : http://[${ip6}]:${HTTP_PORT}${RESET}"
+      echo
     done <<< "${ipv6_list}"
   else
     warn "未检测到网卡绑定的公网 IPv6（可能只绑定了 ULA(fdxx) 或未配置 /128）。"
   fi
 
-  print_ipv6_bind_hint_if_needed
-
   echo
   echo "${BOLD}================ 一键复制测试命令 ================${RESET}"
   cat <<EOF
 # ✅ VPS 本机测试（复制整段执行）
-ss -lntp | grep ${SOCKS_PORT} || true
-curl -v -x socks5h://127.0.0.1:${SOCKS_PORT} https://api.ipify.org && echo
-curl -v -x socks5h://127.0.0.1:${SOCKS_PORT} https://ipv6.icanhazip.com && echo
+ss -lntp | grep -E ':${SOCKS_PORT}|:${HTTP_PORT}' || true
 
-# ✅ 外网测试（如你有公网 IPv6 可直连）
+# SOCKS5 测试
+curl -fsS --max-time 8 -x socks5h://127.0.0.1:${SOCKS_PORT} https://api.ipify.org && echo
+curl -fsS --max-time 8 -x socks5h://127.0.0.1:${SOCKS_PORT} https://ipv6.icanhazip.com && echo
+
+# HTTP 代理测试
+curl -fsS --max-time 8 -x http://127.0.0.1:${HTTP_PORT} https://api.ipify.org && echo
+curl -fsS --max-time 8 -x http://127.0.0.1:${HTTP_PORT} https://ipv6.icanhazip.com && echo
+
+# ✅ 外网 IPv6 测试（如你可直连公网 IPv6）
 # nc -vz <你的IPv6> ${SOCKS_PORT}
+# nc -vz <你的IPv6> ${HTTP_PORT}
 # curl -vv --socks5-hostname "[<你的IPv6>]:${SOCKS_PORT}" https://api.ipify.org
+# curl -vv -x "http://[<你的IPv6>]:${HTTP_PORT}" https://api.ipify.org
 EOF
 }
 
